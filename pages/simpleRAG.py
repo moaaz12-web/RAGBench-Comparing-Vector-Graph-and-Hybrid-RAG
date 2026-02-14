@@ -1,127 +1,77 @@
-import os
+from __future__ import annotations
+
 import streamlit as st
-from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain.prompts import ChatPromptTemplate
-from langchain.schema.output_parser import StrOutputParser
-from langchain_core.runnables import (
-    RunnableParallel,
-    RunnablePassthrough
+from langchain_core.runnables import RunnableLambda
+
+from utils.config import get_config
+from utils.rag_components import build_answer_chain, build_embeddings, format_documents
+from utils.streamlit_helpers import (
+    render_evaluation_section,
+    stop_if_missing_required_vars,
 )
-from langchain_openai import ChatOpenAI
-from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
-import json
-
-# Import env
-from dotenv import load_dotenv
-load_dotenv()
-
-# Define the prompt template
-prompt_str = """You are a chatbot that answers questions from the context below. You need to be accurate in your responses. 
-Provide descriptive answers based on the provided context. DO NOT MAKE STUFF UP BY YOURSELF.
-Context : {contexte}
-Question : {question}
-Response : """
 
 
-# Define the prompt and output parser
-prompt = ChatPromptTemplate.from_template(prompt_str)
-output_parser = StrOutputParser()
+CONFIG = get_config()
 
-# Create the chain for SimpleRAG
+
+@st.cache_resource(show_spinner=False)
+def get_vectorstore() -> FAISS:
+    if not CONFIG.faiss_index_dir.exists():
+        raise FileNotFoundError(
+            f"FAISS index directory not found at '{CONFIG.faiss_index_dir}'. Run updateDB.py first."
+        )
+    return FAISS.load_local(
+        str(CONFIG.faiss_index_dir),
+        build_embeddings(CONFIG),
+        allow_dangerous_deserialization=True,
+    )
+
+
+@st.cache_resource(show_spinner=False)
 def create_chain():
-    # Create embeddings
-    embeddings = OpenAIEmbeddings()
-
-    vectorstore = FAISS.load_local(
-        os.path.join(os.path.dirname(__file__), "faiss_index"), embeddings, allow_dangerous_deserialization=True
+    retriever = get_vectorstore().as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": CONFIG.rag_top_k},
+    )
+    return build_answer_chain(
+        context_runnable=retriever | RunnableLambda(format_documents),
+        model=CONFIG.openai_chat_model,
+        config=CONFIG,
     )
 
-    # Define the retrievers
-    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 3})
 
-    llm = ChatOpenAI(temperature=0, model_name="gpt-4")
-
-    # Create the retrieval chain
-    retrieval = RunnableParallel(
-        {"contexte": retriever, "question": RunnablePassthrough()}
-    )
-    chain = retrieval | prompt | llm | output_parser
-
-    return chain
-
-
-# Function to create JSON output for evaluation
-# Function to evaluate predicted answer
-def evaluate_predicted_answer(question, actual_answer, predicted_answer):
-    # Initialize LLM with GPT-4 model
-    llm = ChatOpenAI(temperature=0, model_name="gpt-4")
-
-    # Define the prompt template
-    prompt_str = """You are a critical evaluator. You will be given a question, an actual (true) answer, and a predicted answer. You need to rate the predicted answer on a scale of 0 to 10 based on how closely it resembles the actual answer contextually. If the predicted answer is contextually diffrerent than the actual answer, you give a babd rating. Be highly critical when giving rating. You need to output in JSON format with the rating and your justification. So the output should strictly be a rating and a justification in key value pair, as in JSON format. Do not write anything else, do not provide any other message other than the JSON format.
-    Below are the question, the actual (true) answer, and the predicted answer:
-    {question}
-    {actual_answer}
-    {predicted_answer}
-    """
-
-    prompt = ChatPromptTemplate.from_template(prompt_str)
-    output_parser = StrOutputParser()
-
-    chain = prompt | llm | output_parser
-    res = chain.invoke({
-        "question": question,
-        "actual_answer": actual_answer,
-        "predicted_answer": predicted_answer
-    })
-
-    return res
-
-
-def main():
+def main() -> None:
     st.title("SimpleRAG PDF Question-Answering App")
 
-    # Create two columns for SimpleRAG and Evaluation side by side
+    stop_if_missing_required_vars(CONFIG)
+
+    try:
+        chain = create_chain()
+    except FileNotFoundError as exc:
+        st.error(str(exc))
+        st.stop()
+
     col1, col2 = st.columns(2)
 
-    # Left Side: SimpleRAG
     with col1:
         st.subheader("SimpleRAG Section")
-        st.write("Ask a question based on the pre-loaded PDF document.")
+        st.write("Ask a question based on the indexed PDF documents.")
+        user_question = st.text_input("Enter your question:", key="simple_question")
 
-        # Create the SimpleRAG chain
-        chain = create_chain()
-
-        # Input for user question and actual answer
-        user_question = st.text_input("Enter your question:")
-
-        # Section to display the predicted answer
         if user_question:
             with st.spinner("Getting answer..."):
                 predicted_answer = chain.invoke(user_question)
+                st.session_state["simple_predicted_answer"] = predicted_answer
                 st.write(f"**SimpleRAG Predicted Answer:** {predicted_answer}")
 
-    # Right Side: Evaluation
     with col2:
-        st.subheader("Evaluation Section")
-        st.write("This section evaluates how close the predicted answer is to the actual answer.")
-        actual_answer = st.text_input("Enter the actual answer:")
+        render_evaluation_section(
+            user_question=user_question,
+            actual_answer_key="simple_actual_answer",
+            predicted_answer_key="simple_predicted_answer",
+            config=CONFIG,
+        )
 
 
-        # Check if both question and actual answer are provided
-        if user_question and actual_answer:
-            
-            # Create and display JSON output for evaluation
-            evaluation_json =  evaluate_predicted_answer(user_question, actual_answer, predicted_answer)
-            st.subheader("LLM checker output")
-            st.json(evaluation_json)
-
-        # Inform the user to provide both fields for evaluation
-        elif user_question and not actual_answer:
-            st.info("Provide an actual answer for evaluation.")
-
-# Run the Streamlit app
 main()

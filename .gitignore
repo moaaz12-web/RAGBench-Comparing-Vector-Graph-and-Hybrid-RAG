@@ -1,3 +1,6 @@
 myenv5
 .env
 /myenv5
+.venv
+__pycache__/
+*.py[cod]

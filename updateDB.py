@@ -1,68 +1,78 @@
-import os
-from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
+from __future__ import annotations
+
+from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
 from langchain_community.vectorstores import FAISS
-from langchain_community.graphs import Neo4jGraph
-from langchain_openai import ChatOpenAI
 from langchain_experimental.graph_transformers import LLMGraphTransformer
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# Import env
-from dotenv import load_dotenv
-def save_faiss():
-    # Create embeddings
-    embeddings = OpenAIEmbeddings()
+from utils.config import get_config
+from utils.graph import create_neo4j_graph
+from utils.rag_components import build_chat_model, build_embeddings
 
-    # Load documents
-    loader = DirectoryLoader("./data", glob="*.pdf", loader_cls=PyPDFLoader)
+
+CONFIG = get_config()
+
+
+def load_pdfs():
+    loader = DirectoryLoader(
+        str(CONFIG.data_dir),
+        glob=CONFIG.pdf_glob,
+        loader_cls=PyPDFLoader,
+    )
     documents = loader.load()
+    if not documents:
+        raise ValueError(
+            f"No PDF documents found in '{CONFIG.data_dir}' using glob '{CONFIG.pdf_glob}'."
+        )
+    return documents
 
-    # Split the documents into chunks
+
+def save_faiss() -> None:
+    documents = load_pdfs()
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=5500,
-        chunk_overlap=200,
-        length_function=len,
-        is_separator_regex=False,
+        chunk_size=CONFIG.faiss_chunk_size,
+        chunk_overlap=CONFIG.faiss_chunk_overlap,
     )
     splits = text_splitter.split_documents(documents)
+    vectorstore = FAISS.from_documents(splits, build_embeddings(CONFIG))
+    CONFIG.faiss_index_dir.mkdir(parents=True, exist_ok=True)
+    vectorstore.save_local(str(CONFIG.faiss_index_dir))
+    print(f"FAISS index stored successfully at '{CONFIG.faiss_index_dir}'.")
 
-    # Create the vectorstore
-    vectorstore = FAISS.from_documents(splits, embeddings)
-    vectorstore.save_local("./pages/faiss_index")
 
-    print("FAISS index stored successfully.")
-
-def save_graph():
-    # Set up the Neo4j graph
-    graph = Neo4jGraph()
-
-    # Set up the LLM for graph transformation
-    llm = ChatOpenAI(temperature=0, model_name="gpt-3.5-turbo-0125")
-    llm_transformer = LLMGraphTransformer(llm=llm)
-
-    # Load documents
-    loader = DirectoryLoader("./data", glob="*.pdf", loader_cls=PyPDFLoader)
-    pages = loader.load()
-
-    # Split the documents into chunks
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=200,
-        length_function=len,
-        is_separator_regex=False,
+def save_graph() -> None:
+    graph = create_neo4j_graph(CONFIG)
+    llm = build_chat_model(
+        model=CONFIG.openai_ingest_model,
+        temperature=0.0,
+        config=CONFIG,
     )
-    documents = text_splitter.split_documents(pages)
-
-    # Convert documents to graph documents and add to Neo4j
-    graph_documents = llm_transformer.convert_to_graph_documents(documents)
+    llm_transformer = LLMGraphTransformer(llm=llm)
+    documents = load_pdfs()
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CONFIG.graph_chunk_size,
+        chunk_overlap=CONFIG.graph_chunk_overlap,
+    )
+    graph_documents = llm_transformer.convert_to_graph_documents(
+        text_splitter.split_documents(documents)
+    )
     graph.add_graph_documents(
         graph_documents,
         baseEntityLabel=True,
-        include_source=True
+        include_source=True,
     )
-
     print("Documents saved to Neo4j graph successfully.")
 
-# Call the functions
-save_faiss()
-save_graph()
+
+def main() -> None:
+    if CONFIG.missing_required_vars:
+        raise EnvironmentError(
+            "Missing required environment variable(s): "
+            + ", ".join(CONFIG.missing_required_vars)
+        )
+    save_faiss()
+    save_graph()
+
+
+if __name__ == "__main__":
+    main()
